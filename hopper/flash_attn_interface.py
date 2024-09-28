@@ -96,6 +96,10 @@ def _flash_attn_varlen_forward(
     window_size=(-1, -1),
     seqused_q=None,
     seqused_k=None,
+    descale_q=None,
+    descale_k=None,
+    descale_v=None,
+    gqa_parallel=False,
 ):
     assert (
         block_table is None or k.dtype != torch.float8_e4m3fn
@@ -115,9 +119,13 @@ def _flash_attn_varlen_forward(
         max_seqlen_q,
         max_seqlen_k,
         softmax_scale,
+        descale_q,
+        descale_k,
+        descale_v,
         causal,
         window_size[0],
         window_size[1],
+        gqa_parallel,
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
@@ -262,6 +270,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         seqused_q=None,
         seqused_k=None,
         block_table=None,
+        descale_q=None,
+        descale_k=None,
+        descale_v=None,
+        gqa_parallel=False,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -279,6 +291,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqused_q=seqused_q,
             seqused_k=seqused_k,
             block_table=block_table,
+            descale_q=descale_q,
+            descale_k=descale_k,
+            descale_v=descale_v,
+            gqa_parallel=gqa_parallel,
         )
         ctx.save_for_backward(
             q,
@@ -333,6 +349,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             dq,
             dk,
             dv,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -441,6 +461,10 @@ def flash_attn_varlen_func(
     seqused_q=None,
     seqused_k=None,
     block_table=None,
+    descale_q=None,
+    descale_k=None,
+    descale_v=None,
+    gqa_parallel=False,
 ):
     """
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -498,6 +522,10 @@ def flash_attn_varlen_func(
         seqused_q,
         seqused_k,
         block_table,
+        descale_q,
+        descale_k,
+        descale_v,
+        gqa_parallel,
     )
 
 

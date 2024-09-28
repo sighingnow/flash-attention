@@ -641,17 +641,19 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                int max_seqlen_q,
                const int max_seqlen_k,
                const float softmax_scale,
+               c10::optional<at::Tensor> &descale_q_, // 1
+               c10::optional<at::Tensor> &descale_k_, // 1
+               c10::optional<at::Tensor> &descale_v_, // 1
                bool is_causal,
                int window_size_left,
-               int window_size_right) {
+               int window_size_right,
+               bool use_gqa_packing = false) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
     TORCH_CHECK(is_sm90, "FlashAttention only supports Hopper GPUs or newer.");
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
@@ -740,13 +742,20 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        TORCH_CHECK(q_dtype == at::ScalarType::Float8_e4m3fn
+                    ? (out.dtype() == at::kHalf)
+                    : (out.dtype() == q_dtype),
+                "Output must have the same dtype as input dtype if dtype is "
+                "not fp8, or fp16 for fp8 input.");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, sizes[0], sizes[1], head_size_og);
         if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
     } else {
-        out = torch::empty_like(q_padded);
+        if (q_dtype == at::ScalarType::Float8_e4m3fn)
+            out = torch::empty_like(q_padded, at::kBFloat16);
+        else
+            out = torch::empty_like(q_padded);
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
@@ -796,6 +805,34 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
     params.page_block_size = page_block_size;
     params.page_num_blocks = num_blocks;
+
+    at::Tensor descale_q, descale_k, descale_v;
+    if(q_dtype == at::ScalarType::Float8_e4m3fn) {
+        if (descale_q_.has_value()) {
+            descale_q = descale_q_.value();
+            CHECK_DEVICE(descale_q);
+            CHECK_SHAPE(descale_q, 1);
+        } else { descale_q = torch::ones({1}, opts.dtype(at::kFloat)); }
+        if (descale_k_.has_value()) {
+            descale_k = descale_k_.value();
+            CHECK_DEVICE(descale_k);
+            CHECK_SHAPE(descale_k, 1);
+        } else { descale_k = torch::ones({1}, opts.dtype(at::kFloat)); }
+        if (descale_v_.has_value()) {
+            descale_v = descale_v_.value();
+            CHECK_DEVICE(descale_v);
+            CHECK_SHAPE(descale_v, 1);
+        } else { descale_v = torch::ones({1}, opts.dtype(at::kFloat)); }
+        params.descale_q_ptr = descale_q.data_ptr<float>();
+        params.descale_k_ptr = descale_k.data_ptr<float>();
+        params.descale_v_ptr = descale_v.data_ptr<float>();
+    } else {
+        params.descale_q_ptr = nullptr;
+        params.descale_k_ptr = nullptr;
+        params.descale_v_ptr = nullptr;
+    }
+    
+    params.use_gqa_packing = use_gqa_packing;
 
     //printf("mha_varlen_fwd: params.seqlen_k=%d, max_seqlen_k=%d, params.page_num_blocks=%d\n", (int)params.seqlen_k, (int)max_seqlen_k, (int)params.page_num_blocks);
     if (max_seqlen_k > 0) {
